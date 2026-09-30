@@ -1,0 +1,15 @@
+{
+  "name": "aether-ledger",
+  "version": "0.1.0",
+  "description": "A secure, multi-vertical blockchain engine to tokenize Real Estate, Supply Chain, and Carbon Credits.",
+  "private": true,
+  "type": "commonjs",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
