@@ -3,318 +3,21 @@
 
 const http = require('node:http');
 const crypto = require('node:crypto');
-const fs = require('node:fs');
 const path = require('node:path');
-const Database = require('better-sqlite3');
+const { SecurityEngine, VERTICALS } = require('./config/security');
+const { initializeDatabase } = require('./config/database');
 
 const PORT = Number(process.env.PORT || 3000);
 const DB_FILE = process.env.DB_FILE || path.join(__dirname, 'aether.db');
 const MAX_BODY_BYTES = 1024 * 1024;
 
-const VERTICALS = {
-  real_estate: { name: 'Real Estate', unit: 'token', retireable: false },
-  supply_chain: { name: 'Supply Chain', unit: 'unit', retireable: false },
-  carbon_credits: { name: 'Carbon Credits', unit: 'tCO2e', retireable: true }
-};
-
-const ROLES = {
-  admin: { permissions: ['*'] },
-  issuer: { permissions: ['issue', 'transfer', 'audit'] },
-  holder: { permissions: ['transfer', 'view'] },
-  auditor: { permissions: ['audit', 'view'] },
-  retired: { permissions: ['view'] }
-};
-
-const sha256 = value => crypto.createHash('sha256').update(value).digest('hex');
-const canonical = value => JSON.stringify(value, Object.keys(value).sort());
+const sha256 = (value) => crypto.createHash('sha256').update(value).digest('hex');
+const canonical = (obj) => JSON.stringify(obj, Object.keys(obj).sort());
 const now = () => new Date().toISOString();
 const randomId = (prefix) => `${prefix}_${crypto.randomUUID()}`;
 
-class Database_ {
-  constructor(file) {
-    this.db = new Database(file);
-    this.db.pragma('journal_mode = WAL');
-    this.db.pragma('foreign_keys = ON');
-    this.init();
-  }
-
-  init() {
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS identities (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL UNIQUE,
-        role TEXT NOT NULL DEFAULT 'holder',
-        publicKey TEXT NOT NULL UNIQUE,
-        createdAt TEXT NOT NULL,
-        active INTEGER DEFAULT 1
-      );
-
-      CREATE TABLE IF NOT EXISTS assets (
-        id TEXT PRIMARY KEY,
-        vertical TEXT NOT NULL,
-        name TEXT NOT NULL,
-        issuerId TEXT NOT NULL,
-        supply REAL NOT NULL,
-        circulatingSupply REAL NOT NULL,
-        retiredSupply REAL NOT NULL DEFAULT 0,
-        metadata TEXT NOT NULL,
-        createdAt TEXT NOT NULL,
-        FOREIGN KEY (issuerId) REFERENCES identities(id)
-      );
-
-      CREATE TABLE IF NOT EXISTS balances (
-        assetId TEXT NOT NULL,
-        holderId TEXT NOT NULL,
-        amount REAL NOT NULL,
-        updatedAt TEXT NOT NULL,
-        PRIMARY KEY (assetId, holderId),
-        FOREIGN KEY (assetId) REFERENCES assets(id),
-        FOREIGN KEY (holderId) REFERENCES identities(id)
-      );
-
-      CREATE TABLE IF NOT EXISTS transactions (
-        id TEXT PRIMARY KEY,
-        type TEXT NOT NULL,
-        assetId TEXT NOT NULL,
-        from TEXT,
-        to TEXT,
-        amount REAL NOT NULL,
-        signature TEXT NOT NULL,
-        blockIndex INTEGER NOT NULL,
-        timestamp TEXT NOT NULL,
-        metadata TEXT,
-        FOREIGN KEY (assetId) REFERENCES assets(id),
-        FOREIGN KEY (from) REFERENCES identities(id),
-        FOREIGN KEY (to) REFERENCES identities(id)
-      );
-
-      CREATE TABLE IF NOT EXISTS blocks (
-        index INTEGER PRIMARY KEY,
-        hash TEXT NOT NULL UNIQUE,
-        previousHash TEXT NOT NULL,
-        timestamp TEXT NOT NULL,
-        transactionCount INTEGER NOT NULL,
-        miner TEXT NOT NULL,
-        nonce INTEGER NOT NULL DEFAULT 0
-      );
-
-      CREATE TABLE IF NOT EXISTS audits (
-        id TEXT PRIMARY KEY,
-        assetId TEXT NOT NULL,
-        auditorId TEXT NOT NULL,
-        result TEXT NOT NULL,
-        timestamp TEXT NOT NULL,
-        FOREIGN KEY (assetId) REFERENCES assets(id),
-        FOREIGN KEY (auditorId) REFERENCES identities(id)
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_balances_holder ON balances(holderId);
-      CREATE INDEX IF NOT EXISTS idx_transactions_asset ON transactions(assetId);
-      CREATE INDEX IF NOT EXISTS idx_transactions_from ON transactions(from);
-      CREATE INDEX IF NOT EXISTS idx_transactions_to ON transactions(to);
-      CREATE INDEX IF NOT EXISTS idx_assets_vertical ON assets(vertical);
-    `);
-  }
-
-  createIdentity(name, role = 'holder') {
-    if (!ROLES[role]) throw new Error('invalid role');
-    const id = randomId('id');
-    const publicKey = sha256(id).substring(0, 32);
-    const stmt = this.db.prepare('INSERT INTO identities (id, name, role, publicKey, createdAt) VALUES (?, ?, ?, ?, ?)');
-    stmt.run(id, name, role, publicKey, now());
-    return { id, name, role, publicKey };
-  }
-
-  getIdentity(id) {
-    return this.db.prepare('SELECT id, name, role, publicKey, createdAt FROM identities WHERE id = ?').get(id);
-  }
-
-  listIdentities() {
-    return this.db.prepare('SELECT id, name, role, publicKey, createdAt, active FROM identities WHERE active = 1').all();
-  }
-
-  deactivateIdentity(id) {
-    const stmt = this.db.prepare('UPDATE identities SET active = 0 WHERE id = ?');
-    stmt.run(id);
-  }
-
-  issueAsset(vertical, name, issuerId, supply, metadata = {}) {
-    if (!VERTICALS[vertical]) throw new Error('invalid vertical');
-    const identity = this.getIdentity(issuerId);
-    if (!identity) throw new Error('issuer not found');
-    if (identity.role !== 'issuer' && identity.role !== 'admin') throw new Error('unauthorized to issue');
-
-    const id = randomId('ast');
-    const stmt = this.db.prepare(
-      'INSERT INTO assets (id, vertical, name, issuerId, supply, circulatingSupply, retiredSupply, metadata, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
-    );
-    stmt.run(id, vertical, name, issuerId, supply, supply, 0, JSON.stringify(metadata), now());
-
-    const balanceStmt = this.db.prepare('INSERT INTO balances (assetId, holderId, amount, updatedAt) VALUES (?, ?, ?, ?)');
-    balanceStmt.run(id, issuerId, supply, now());
-
-    return this.getAsset(id);
-  }
-
-  getAsset(id) {
-    const asset = this.db.prepare(
-      'SELECT id, vertical, name, issuerId, supply, circulatingSupply, retiredSupply, metadata, createdAt FROM assets WHERE id = ?'
-    ).get(id);
-    if (asset) asset.metadata = JSON.parse(asset.metadata);
-    return asset;
-  }
-
-  listAssets(vertical = null) {
-    let query = 'SELECT id, vertical, name, issuerId, supply, circulatingSupply, retiredSupply, metadata, createdAt FROM assets';
-    const params = [];
-    if (vertical) {
-      query += ' WHERE vertical = ?';
-      params.push(vertical);
-    }
-    const assets = this.db.prepare(query).all(...params);
-    return assets.map(a => ({ ...a, metadata: JSON.parse(a.metadata) }));
-  }
-
-  getBalance(assetId, holderId) {
-    return this.db.prepare('SELECT amount FROM balances WHERE assetId = ? AND holderId = ?').get(assetId, holderId)?.amount || 0;
-  }
-
-  getAssetBalances(assetId) {
-    return this.db.prepare('SELECT holderId, amount FROM balances WHERE assetId = ?').all(assetId);
-  }
-
-  transfer(assetId, from, to, amount, fromIdentity) {
-    const fromBalance = this.getBalance(assetId, from);
-    if (fromBalance < amount) throw new Error('insufficient balance');
-
-    const txId = randomId('tx');
-    const signature = sha256(`${txId}${from}${to}${amount}`).substring(0, 32);
-    const blockIndex = this.getLatestBlockIndex() + 1;
-
-    const txStmt = this.db.prepare(
-      'INSERT INTO transactions (id, type, assetId, from, to, amount, signature, blockIndex, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
-    );
-    txStmt.run(txId, 'transfer', assetId, from, to, amount, signature, blockIndex, now());
-
-    const updateFromStmt = this.db.prepare('UPDATE balances SET amount = amount - ?, updatedAt = ? WHERE assetId = ? AND holderId = ?');
-    updateFromStmt.run(amount, now(), assetId, from);
-
-    const updateToStmt = this.db.prepare(
-      'INSERT INTO balances (assetId, holderId, amount, updatedAt) VALUES (?, ?, ?, ?) ON CONFLICT(assetId, holderId) DO UPDATE SET amount = amount + ?, updatedAt = ?'
-    );
-    updateToStmt.run(assetId, to, amount, now(), amount, now());
-
-    return { id: txId, type: 'transfer', assetId, from, to, amount, signature, timestamp: now() };
-  }
-
-  retireCredits(assetId, holderId, amount) {
-    const asset = this.getAsset(assetId);
-    if (!VERTICALS[asset.vertical].retireable) throw new Error('asset cannot be retired');
-
-    const balance = this.getBalance(assetId, holderId);
-    if (balance < amount) throw new Error('insufficient balance');
-
-    const txId = randomId('tx');
-    const signature = sha256(`${txId}${holderId}retire${amount}`).substring(0, 32);
-    const blockIndex = this.getLatestBlockIndex() + 1;
-
-    const txStmt = this.db.prepare(
-      'INSERT INTO transactions (id, type, assetId, from, to, amount, signature, blockIndex, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
-    );
-    txStmt.run(txId, 'retire', assetId, holderId, null, amount, signature, blockIndex, now());
-
-    const updateBalanceStmt = this.db.prepare('UPDATE balances SET amount = amount - ?, updatedAt = ? WHERE assetId = ? AND holderId = ?');
-    updateBalanceStmt.run(amount, now(), assetId, holderId);
-
-    const updateAssetStmt = this.db.prepare('UPDATE assets SET circulatingSupply = circulatingSupply - ?, retiredSupply = retiredSupply + ? WHERE id = ?');
-    updateAssetStmt.run(amount, amount, assetId);
-
-    return { id: txId, type: 'retire', assetId, holderId, amount, signature, timestamp: now() };
-  }
-
-  getLatestBlockIndex() {
-    return this.db.prepare('SELECT MAX(index) as maxIndex FROM blocks').get().maxIndex || -1;
-  }
-
-  createBlock(transactionCount, miner) {
-    const index = this.getLatestBlockIndex() + 1;
-    const previous = this.db.prepare('SELECT hash FROM blocks WHERE index = ?').get(index - 1);
-    const previousHash = previous?.hash || ('0'.repeat(64));
-    const blockData = { index, timestamp: now(), previousHash, transactionCount, miner, nonce: 0 };
-    const hash = sha256(canonical(blockData));
-
-    const stmt = this.db.prepare('INSERT INTO blocks (index, hash, previousHash, timestamp, transactionCount, miner, nonce) VALUES (?, ?, ?, ?, ?, ?, ?)');
-    stmt.run(index, hash, previousHash, blockData.timestamp, transactionCount, miner, 0);
-
-    return { index, hash, previousHash, timestamp: blockData.timestamp, transactionCount, miner };
-  }
-
-  getBlocks() {
-    return this.db.prepare('SELECT index, hash, previousHash, timestamp, transactionCount, miner FROM blocks ORDER BY index').all();
-  }
-
-  getTransactions(assetId = null) {
-    let query = 'SELECT id, type, assetId, from, to, amount, signature, blockIndex, timestamp FROM transactions';
-    const params = [];
-    if (assetId) {
-      query += ' WHERE assetId = ?';
-      params.push(assetId);
-    }
-    return this.db.prepare(query + ' ORDER BY blockIndex DESC').all(...params);
-  }
-
-  audit(assetId, auditorId) {
-    const identity = this.getIdentity(auditorId);
-    if (identity.role !== 'auditor' && identity.role !== 'admin') throw new Error('unauthorized to audit');
-
-    const asset = this.getAsset(assetId);
-    const balances = this.getAssetBalances(assetId);
-    const transactions = this.getTransactions(assetId);
-    const blocks = this.getBlocks();
-
-    let totalBalance = 0;
-    for (const b of balances) totalBalance += b.amount;
-    totalBalance += asset.retiredSupply;
-
-    const result = {
-      valid: totalBalance === asset.supply,
-      assetId,
-      supply: asset.supply,
-      totalBalance,
-      retired: asset.retiredSupply,
-      holders: balances.length,
-      transactions: transactions.length,
-      chainValid: this.validateChain().valid
-    };
-
-    const auditId = randomId('audit');
-    const stmt = this.db.prepare('INSERT INTO audits (id, assetId, auditorId, result, timestamp) VALUES (?, ?, ?, ?, ?)');
-    stmt.run(auditId, assetId, auditorId, JSON.stringify(result), now());
-
-    return result;
-  }
-
-  validateChain() {
-    const blocks = this.getBlocks();
-    if (blocks.length === 0) return { valid: true, length: 0 };
-
-    for (let i = 0; i < blocks.length; i += 1) {
-      const block = blocks[i];
-      const blockData = { index: block.index, timestamp: block.timestamp, previousHash: block.previousHash, transactionCount: block.transactionCount, miner: block.miner, nonce: block.nonce };
-      const hash = sha256(canonical(blockData));
-      if (hash !== block.hash) return { valid: false, index: i, reason: 'hash mismatch' };
-      if (i === 0 && block.previousHash !== '0'.repeat(64)) return { valid: false, index: i, reason: 'invalid genesis' };
-      if (i > 0 && block.previousHash !== blocks[i - 1].hash) return { valid: false, index: i, reason: 'broken link' };
-    }
-    return { valid: true, length: blocks.length };
-  }
-
-  close() {
-    this.db.close();
-  }
-}
-
-const db = new Database_(DB_FILE);
+const db = initializeDatabase(DB_FILE);
+const security = new SecurityEngine(db);
 
 function error(message, status = 400) {
   const e = new Error(message);
@@ -323,35 +26,271 @@ function error(message, status = 400) {
 }
 
 function requiredString(value, name, max = 256) {
-  if (typeof value !== 'string' || value.trim() === '' || value.length > max) throw error(`${name} must be a non-empty string (max ${max} characters)`);
+  if (typeof value !== 'string' || value.trim() === '' || value.length > max) {
+    throw error(`${name} must be a non-empty string (max ${max} characters)`);
+  }
   return value.trim();
 }
 
 function positiveNumber(value, name) {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) throw error(`${name} must be a positive number`);
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+    throw error(`${name} must be a positive number`);
+  }
   return value;
 }
 
 function send(res, status, payload) {
-  const body = JSON.stringify(payload, null, 2);
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
-  res.end(body);
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff'
+  });
+  res.end(JSON.stringify(payload, null, 2));
 }
 
-async function readJson(req) {
-  let size = 0;
-  let body = '';
-  for await (const chunk of req) {
-    size += chunk.length;
-    if (size > MAX_BODY_BYTES) throw error('request body is too large', 413);
-    body += chunk;
+function parseJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    let body = '';
+
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > MAX_BODY_BYTES) {
+        reject(error('request body is too large', 413));
+        req.destroy();
+      }
+      body += chunk;
+    });
+
+    req.on('end', () => {
+      if (!body.trim()) return resolve({});
+      try {
+        resolve(JSON.parse(body));
+      } catch {
+        reject(error('request body must be valid JSON'));
+      }
+    });
+
+    req.on('error', (err) => reject(err));
+  });
+}
+
+function ensureIdentityExists(id) {
+  const identity = db.prepare('SELECT id, name, role, publicKey, createdAt FROM identities WHERE id = ? AND active = 1').get(id);
+  if (!identity) throw error('identity not found', 404);
+  return identity;
+}
+
+function getIdentityByToken(token) {
+  if (!token) return null;
+  return db.prepare('SELECT id, name, role, publicKey FROM identities WHERE publicKey = ? AND active = 1').get(token);
+}
+
+function authenticateRequest(req) {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.substring(7) : null;
+  if (!token) throw error('Missing Authorization header. Use Bearer <token>', 401);
+
+  const identity = getIdentityByToken(token);
+  if (!identity) throw error('Invalid or expired bearer token', 401);
+  return identity;
+}
+
+function issueIdentity(name, role = 'holder') {
+  const allowedRoles = ['holder', 'issuer', 'auditor', 'admin'];
+  if (!allowedRoles.includes(role)) throw error('invalid role');
+
+  const id = randomId('id');
+  const publicKey = sha256(`${id}:${name}:${role}:${now()}`);
+  const createdAt = now();
+
+  db.prepare(`
+    INSERT INTO identities (id, name, role, publicKey, createdAt, updatedAt, active, metadata)
+    VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+  `).run(id, name, role, publicKey, createdAt, createdAt, JSON.stringify({ createdVia: 'api' }));
+
+  return { id, name, role, publicKey, createdAt, token: publicKey };
+}
+
+function getAsset(assetId) {
+  const asset = db.prepare(`
+    SELECT id, vertical, name, description, issuerId, supply, circulatingSupply, retiredSupply, metadata, createdAt
+    FROM assets WHERE id = ?
+  `).get(assetId);
+
+  if (!asset) return null;
+  asset.metadata = asset.metadata ? JSON.parse(asset.metadata) : {};
+  return asset;
+}
+
+function listAssets(vertical = null) {
+  let query = 'SELECT id, vertical, name, description, issuerId, supply, circulatingSupply, retiredSupply, metadata, createdAt FROM assets';
+  const params = [];
+  if (vertical) {
+    query += ' WHERE vertical = ?';
+    params.push(vertical);
   }
-  if (!body.trim()) return {};
-  try {
-    return JSON.parse(body);
-  } catch {
-    throw error('request body must be valid JSON');
+  const rows = db.prepare(query).all(...params);
+  return rows.map((row) => ({ ...row, metadata: row.metadata ? JSON.parse(row.metadata) : {} }));
+}
+
+function getBalances(assetId) {
+  return db.prepare('SELECT holderId, amount FROM balances WHERE assetId = ? ORDER BY holderId').all(assetId);
+}
+
+function getLatestBlockIndex() {
+  return db.prepare('SELECT MAX(index) AS maxIndex FROM blocks').get()?.maxIndex ?? -1;
+}
+
+function createGenesisBlock() {
+  const count = db.prepare('SELECT COUNT(*) AS count FROM blocks').get().count;
+  if (count > 0) return null;
+  const block = createBlock(0, 'genesis');
+  return block;
+}
+
+function createBlock(transactionCount, miner) {
+  const index = getLatestBlockIndex() + 1;
+  const previous = db.prepare('SELECT hash FROM blocks WHERE index = ?').get(index - 1);
+  const previousHash = previous?.hash || '0'.repeat(64);
+  const timestamp = now();
+  const payload = { index, timestamp, previousHash, transactionCount, miner, nonce: 0 };
+  const hash = sha256(canonical(payload));
+
+  db.prepare(`
+    INSERT INTO blocks (index, hash, previousHash, timestamp, transactionCount, miner, nonce)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(index, hash, previousHash, timestamp, transactionCount, miner, 0);
+
+  return { index, hash, previousHash, timestamp, transactionCount, miner };
+}
+
+function validateChain() {
+  const blocks = db.prepare('SELECT index, hash, previousHash, timestamp, transactionCount, miner, nonce FROM blocks ORDER BY index').all();
+  if (blocks.length === 0) return { valid: true, length: 0 };
+
+  for (let i = 0; i < blocks.length; i += 1) {
+    const block = blocks[i];
+    const payload = {
+      index: block.index,
+      timestamp: block.timestamp,
+      previousHash: block.previousHash,
+      transactionCount: block.transactionCount,
+      miner: block.miner,
+      nonce: block.nonce
+    };
+    const computedHash = sha256(canonical(payload));
+    if (computedHash !== block.hash) return { valid: false, index: i, reason: 'hash mismatch' };
+    if (i === 0 && block.previousHash !== '0'.repeat(64)) return { valid: false, index: i, reason: 'invalid genesis' };
+    if (i > 0 && block.previousHash !== blocks[i - 1].hash) return { valid: false, index: i, reason: 'broken link' };
   }
+
+  return { valid: true, length: blocks.length };
+}
+
+function createAssetRecord({ vertical, name, issuerId, supply, metadata = {}, description = '' }) {
+  if (!VERTICALS[vertical]) throw error('invalid vertical');
+
+  const issuer = ensureIdentityExists(issuerId);
+  if (issuer.role !== 'issuer' && issuer.role !== 'admin') {
+    throw error('issuer role required');
+  }
+
+  const assetId = randomId('ast');
+  const timestamp = now();
+
+  db.prepare(`
+    INSERT INTO assets (id, vertical, name, description, issuerId, supply, circulatingSupply, retiredSupply, metadata, createdAt, updatedAt)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+  `).run(assetId, vertical, name, description, issuerId, supply, supply, JSON.stringify(metadata), timestamp, timestamp);
+
+  db.prepare(`
+    INSERT INTO balances (assetId, holderId, amount, updatedAt)
+    VALUES (?, ?, ?, ?)
+  `).run(assetId, issuerId, supply, timestamp);
+
+  return getAsset(assetId);
+}
+
+function doTransfer({ assetId, from, to, amount, actorId }) {
+  const asset = getAsset(assetId);
+  if (!asset) throw error('asset not found', 404);
+
+  ensureIdentityExists(from);
+  ensureIdentityExists(to);
+
+  const currentBalance = db.prepare('SELECT amount FROM balances WHERE assetId = ? AND holderId = ?').get(assetId, from)?.amount || 0;
+  if (currentBalance < amount) throw error('insufficient balance');
+
+  const txId = randomId('tx');
+  const timestamp = now();
+  const blockIndex = getLatestBlockIndex() + 1;
+  const signature = sha256(`${txId}:${assetId}:${from}:${to}:${amount}:${timestamp}`);
+
+  db.prepare(`
+    INSERT INTO transactions (id, type, assetId, from, to, amount, signature, blockIndex, timestamp, status, metadata)
+    VALUES (?, 'transfer', ?, ?, ?, ?, ?, ?, ?, 'confirmed', ?)
+  `).run(txId, assetId, from, to, amount, signature, blockIndex, timestamp, JSON.stringify({ actorId }));
+
+  db.prepare('UPDATE balances SET amount = amount - ?, updatedAt = ? WHERE assetId = ? AND holderId = ?').run(amount, timestamp, assetId, from);
+  db.prepare(`
+    INSERT INTO balances (assetId, holderId, amount, updatedAt)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(assetId, holderId)
+    DO UPDATE SET amount = amount + excluded.amount, updatedAt = excluded.updatedAt
+  `).run(assetId, to, amount, timestamp);
+
+  return { id: txId, type: 'transfer', assetId, from, to, amount, signature, timestamp };
+}
+
+function retireCredits({ assetId, holderId, amount, actorId }) {
+  const asset = getAsset(assetId);
+  if (!asset) throw error('asset not found', 404);
+  if (!VERTICALS[asset.vertical].retireable) throw error(`${asset.vertical} cannot be retired`);
+
+  const currentBalance = db.prepare('SELECT amount FROM balances WHERE assetId = ? AND holderId = ?').get(assetId, holderId)?.amount || 0;
+  if (currentBalance < amount) throw error('insufficient balance');
+
+  const txId = randomId('tx');
+  const timestamp = now();
+  const blockIndex = getLatestBlockIndex() + 1;
+  const signature = sha256(`${txId}:${assetId}:${holderId}:retire:${amount}:${timestamp}`);
+
+  db.prepare(`
+    INSERT INTO transactions (id, type, assetId, from, to, amount, signature, blockIndex, timestamp, status, metadata)
+    VALUES (?, 'retire', ?, ?, NULL, ?, ?, ?, ?, 'confirmed', ?)
+  `).run(txId, assetId, holderId, amount, signature, blockIndex, timestamp, JSON.stringify({ actorId, retirement: true }));
+
+  db.prepare('UPDATE balances SET amount = amount - ?, updatedAt = ? WHERE assetId = ? AND holderId = ?').run(amount, timestamp, assetId, holderId);
+  db.prepare('UPDATE assets SET circulatingSupply = circulatingSupply - ?, retiredSupply = retiredSupply + ?, updatedAt = ? WHERE id = ?').run(amount, amount, timestamp, assetId);
+
+  return { id: txId, type: 'retire', assetId, holderId, amount, signature, timestamp };
+}
+
+function makeAudit(assetId, auditorId) {
+  const asset = getAsset(assetId);
+  if (!asset) throw error('asset not found', 404);
+
+  const balances = getBalances(assetId);
+  const totalBalance = balances.reduce((sum, row) => sum + Number(row.amount), 0) + Number(asset.retiredSupply || 0);
+  const txCount = db.prepare('SELECT COUNT(*) AS count FROM transactions WHERE assetId = ?').get(assetId).count;
+  const result = {
+    valid: Number(totalBalance) === Number(asset.supply),
+    assetId,
+    supply: Number(asset.supply),
+    totalBalance,
+    retired: Number(asset.retiredSupply || 0),
+    holders: balances.length,
+    transactions: txCount,
+    chainValid: validateChain().valid
+  };
+
+  db.prepare(`
+    INSERT INTO audits (id, assetId, auditorId, result, status, timestamp)
+    VALUES (?, ?, ?, ?, 'completed', ?)
+  `).run(randomId('audit'), assetId, auditorId, JSON.stringify(result), now());
+
+  return result;
 }
 
 async function handler(req, res) {
@@ -359,128 +298,159 @@ async function handler(req, res) {
   const parts = url.pathname.split('/').filter(Boolean);
 
   try {
-    // Health & Status
     if (req.method === 'GET' && url.pathname === '/health') {
-      return send(res, 200, { status: 'ok', service: 'aether-ledger', chainLength: db.getLatestBlockIndex() + 1, integrity: db.validateChain() });
-    }
-
-    // Identities
-    if (req.method === 'GET' && url.pathname === '/v1/identities') {
-      return send(res, 200, { identities: db.listIdentities() });
+      return send(res, 200, {
+        status: 'ok',
+        service: 'aether-ledger',
+        chainLength: getLatestBlockIndex() + 1,
+        integrity: validateChain()
+      });
     }
 
     if (req.method === 'POST' && url.pathname === '/v1/identities') {
-      const input = await readJson(req);
-      const name = requiredString(input.name, 'name', 128);
-      const role = input.role || 'holder';
-      const identity = db.createIdentity(name, role);
-      const block = db.createBlock(1, identity.id);
-      return send(res, 201, { identity, block });
+      const body = await parseJsonBody(req);
+      const name = requiredString(body.name, 'name', 128);
+      const role = body.role || 'holder';
+      const created = issueIdentity(name, role);
+      const block = createBlock(1, created.id);
+      security.logAudit('IDENTITY_CREATED', created.id, 'create-identity', 'identities', true, { role });
+      return send(res, 201, { identity: created, token: created.token, block });
+    }
+
+    const identity = authenticateRequest(req);
+    security.checkRateLimit(identity.id, `${req.method}:${url.pathname}`, 100, 60);
+
+    if (req.method === 'GET' && url.pathname === '/v1/identities') {
+      security.authorize(identity, 'view', 'identities');
+      const rows = db.prepare('SELECT id, name, role, publicKey, createdAt FROM identities WHERE active = 1 ORDER BY createdAt DESC').all();
+      return send(res, 200, { identities: rows });
     }
 
     if (req.method === 'GET' && parts[0] === 'v1' && parts[1] === 'identities' && parts[2]) {
-      const identity = db.getIdentity(parts[2]);
-      if (!identity) throw error('identity not found', 404);
-      return send(res, 200, identity);
+      security.authorize(identity, 'view', 'identity');
+      const row = db.prepare('SELECT id, name, role, publicKey, createdAt FROM identities WHERE id = ?').get(parts[2]);
+      if (!row) throw error('identity not found', 404);
+      return send(res, 200, row);
     }
 
-    // Assets
     if (req.method === 'GET' && url.pathname === '/v1/assets') {
-      const vertical = url.searchParams.get('vertical');
-      return send(res, 200, { assets: db.listAssets(vertical), verticals: VERTICALS });
+      security.authorize(identity, 'view', 'assets');
+      return send(res, 200, { assets: listAssets(url.searchParams.get('vertical') || null), verticals: VERTICALS });
     }
 
     if (req.method === 'POST' && url.pathname === '/v1/assets') {
-      const input = await readJson(req);
-      const vertical = requiredString(input.vertical, 'vertical');
-      if (!VERTICALS[vertical]) throw error('invalid vertical');
-      const name = requiredString(input.name, 'name', 200);
-      const issuerId = requiredString(input.issuerId, 'issuerId');
-      const supply = positiveNumber(input.supply, 'supply');
-      const metadata = input.metadata || {};
-      const asset = db.issueAsset(vertical, name, issuerId, supply, metadata);
-      const block = db.createBlock(1, issuerId);
+      const body = await parseJsonBody(req);
+      security.authorize(identity, 'issue', 'asset');
+      const asset = createAssetRecord({
+        vertical: requiredString(body.vertical, 'vertical'),
+        name: requiredString(body.name, 'name', 200),
+        issuerId: requiredString(body.issuerId, 'issuerId'),
+        supply: positiveNumber(body.supply, 'supply'),
+        metadata: body.metadata && typeof body.metadata === 'object' ? body.metadata : {},
+        description: typeof body.description === 'string' ? body.description : ''
+      });
+      const block = createBlock(1, identity.id);
+      security.logAudit('ASSET_ISSUED', identity.id, 'issue', asset.id, true, { vertical: asset.vertical, supply: asset.supply });
       return send(res, 201, { asset, block });
     }
 
     if (req.method === 'GET' && parts[0] === 'v1' && parts[1] === 'assets' && parts[2]) {
-      const asset = db.getAsset(parts[2]);
+      security.authorize(identity, 'view', 'asset');
+      const asset = getAsset(parts[2]);
       if (!asset) throw error('asset not found', 404);
-      const balances = db.getAssetBalances(parts[2]);
-      return send(res, 200, { asset, balances });
+      return send(res, 200, { asset, balances: getBalances(asset.id) });
     }
 
-    // Transfers
     if (req.method === 'POST' && url.pathname === '/v1/transfers') {
-      const input = await readJson(req);
-      const assetId = requiredString(input.assetId, 'assetId');
-      const from = requiredString(input.from, 'from', 128);
-      const to = requiredString(input.to, 'to', 128);
-      const amount = positiveNumber(input.amount, 'amount');
-      const fromIdentity = db.getIdentity(from);
-      if (!fromIdentity) throw error('sender not found', 404);
-      const transaction = db.transfer(assetId, from, to, amount, fromIdentity);
-      const block = db.createBlock(1, from);
-      const balances = db.getAssetBalances(assetId);
-      return send(res, 201, { transaction, balances, block });
+      const body = await parseJsonBody(req);
+      security.authorize(identity, 'transfer', 'asset-transfer');
+      const transfer = doTransfer({
+        assetId: requiredString(body.assetId, 'assetId'),
+        from: requiredString(body.from, 'from'),
+        to: requiredString(body.to, 'to'),
+        amount: positiveNumber(body.amount, 'amount'),
+        actorId: identity.id
+      });
+      const block = createBlock(1, identity.id);
+      security.logAudit('TRANSFER', identity.id, 'transfer', transfer.assetId, true, { from: transfer.from, to: transfer.to, amount: transfer.amount });
+      return send(res, 201, { transaction: transfer, block, balances: getBalances(transfer.assetId) });
     }
 
-    // Retire
     if (req.method === 'POST' && url.pathname === '/v1/retire') {
-      const input = await readJson(req);
-      const assetId = requiredString(input.assetId, 'assetId');
-      const holderId = requiredString(input.holderId, 'holderId');
-      const amount = positiveNumber(input.amount, 'amount');
-      const transaction = db.retireCredits(assetId, holderId, amount);
-      const block = db.createBlock(1, holderId);
-      return send(res, 201, { transaction, block });
+      const body = await parseJsonBody(req);
+      security.authorize(identity, 'retire', 'asset-retirement');
+      const retire = retireCredits({
+        assetId: requiredString(body.assetId, 'assetId'),
+        holderId: requiredString(body.holderId, 'holderId'),
+        amount: positiveNumber(body.amount, 'amount'),
+        actorId: identity.id
+      });
+      const block = createBlock(1, identity.id);
+      security.logAudit('RETIRE', identity.id, 'retire', retire.assetId, true, { holderId: retire.holderId, amount: retire.amount });
+      return send(res, 201, { transaction: retire, block });
     }
 
-    // Blocks
     if (req.method === 'GET' && url.pathname === '/v1/blocks') {
-      return send(res, 200, { blocks: db.getBlocks() });
+      security.authorize(identity, 'view', 'blocks');
+      const rows = db.prepare('SELECT index, hash, previousHash, timestamp, transactionCount, miner FROM blocks ORDER BY index').all();
+      return send(res, 200, { blocks: rows });
     }
 
-    // Transactions
     if (req.method === 'GET' && url.pathname === '/v1/transactions') {
+      security.authorize(identity, 'view', 'transactions');
       const assetId = url.searchParams.get('assetId');
-      return send(res, 200, { transactions: db.getTransactions(assetId) });
+      if (assetId) {
+        const rows = db.prepare('SELECT * FROM transactions WHERE assetId = ? ORDER BY blockIndex DESC').all(assetId);
+        return send(res, 200, { transactions: rows });
+      }
+      const rows = db.prepare('SELECT * FROM transactions ORDER BY blockIndex DESC').all();
+      return send(res, 200, { transactions: rows });
     }
 
-    // Verify
     if (req.method === 'GET' && url.pathname === '/v1/verify') {
-      return send(res, 200, db.validateChain());
+      security.authorize(identity, 'audit', 'verify');
+      return send(res, 200, validateChain());
     }
 
-    // Audit
     if (req.method === 'POST' && url.pathname === '/v1/audit') {
-      const input = await readJson(req);
-      const assetId = requiredString(input.assetId, 'assetId');
-      const auditorId = requiredString(input.auditorId, 'auditorId');
-      const result = db.audit(assetId, auditorId);
+      const body = await parseJsonBody(req);
+      security.authorize(identity, 'audit', 'audit');
+      const assetId = requiredString(body.assetId, 'assetId');
+      const asset = getAsset(assetId);
+      if (!asset) throw error('asset not found', 404);
+      const result = makeAudit(assetId, identity.id);
+      security.logAudit('AUDIT', identity.id, 'audit', assetId, true, result);
       return send(res, 200, { audit: result });
     }
 
+    if (req.method === 'GET' && url.pathname === '/v1/export') {
+      security.authorize(identity, 'export', 'audit-export');
+      const start = url.searchParams.get('start') || '2000-01-01T00:00:00.000Z';
+      const end = url.searchParams.get('end') || now();
+      const logs = security.exportAuditLog(start, end);
+      return send(res, 200, { export: logs });
+    }
+
     throw error('route not found', 404);
-  } catch (e) {
-    send(res, e.status || 500, { error: e.message || 'internal server error' });
+  } catch (err) {
+    console.error(err);
+    send(res, err.status || 500, { error: err.message || 'internal server error' });
   }
 }
 
 const server = http.createServer(handler);
+createGenesisBlock();
 
 if (require.main === module) {
   server.listen(PORT, () => {
-    console.log(`Aether Ledger v1.0 listening on http://localhost:${PORT}`);
-    console.log(`Database: ${DB_FILE}`);
-    console.log(`Verticals: ${Object.keys(VERTICALS).join(', ')}`);
+    console.log(`Aether Ledger listening on http://localhost:${PORT}`);
+    console.log(`DB: ${DB_FILE}`);
   });
 }
 
-module.exports = { server, db };
+module.exports = { server, db, security, createGenesisBlock, createBlock, validateChain };
 
 process.on('SIGINT', () => {
   console.log('\nShutting down...');
-  db.close();
   server.close(() => process.exit(0));
 });
