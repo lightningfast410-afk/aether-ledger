@@ -33,6 +33,14 @@ const randomId = (prefix) => `${prefix}_${crypto.randomUUID()}`;
 // private keys: anyone holding the secret can forge them, and a holder
 // cannot independently prove authorship. See README.md.
 let HMAC_SECRET = process.env.LEDGER_HMAC_SECRET || null;
+if (!HMAC_SECRET && process.env.NODE_ENV === 'production') {
+  console.error(
+    'ERROR: LEDGER_HMAC_SECRET is not set and NODE_ENV=production. Refusing to start: ' +
+    'transaction attestations would not verify after a restart. ' +
+    'Set LEDGER_HMAC_SECRET to a stable secret from a secret store and restart.'
+  );
+  process.exit(1);
+}
 if (!HMAC_SECRET) {
   HMAC_SECRET = crypto.randomBytes(32).toString('hex');
   console.warn(
@@ -524,6 +532,21 @@ async function handler(req, res) {
       const result = makeAudit(assetId, identity.id);
       security.logAudit('AUDIT', identity.id, 'audit', assetId, true, result);
       return send(res, 200, { audit: result });
+    }
+
+    if (req.method === 'POST' && parts[0] === 'v1' && parts[1] === 'identities' && parts[2] && parts[3] === 'revoke') {
+      // Anti-theft kill switch: a stolen bearer token is killed here.
+      // Authentication already rejects inactive identities, so a revoked
+      // token stops working immediately on every later request.
+      if (identity.role !== 'admin') throw error('admin role required to revoke identities', 403);
+      const targetId = parts[2];
+      if (targetId === identity.id) throw error('an admin cannot revoke their own identity', 400);
+      const target = db.prepare('SELECT id, active FROM identities WHERE id = ?').get(targetId);
+      if (!target) throw error('identity not found', 404);
+      if (!target.active) throw error('identity already revoked', 400);
+      db.prepare('UPDATE identities SET active = 0, updatedAt = ? WHERE id = ?').run(now(), targetId);
+      security.logAudit('IDENTITY_REVOKED', identity.id, 'revoke', targetId, true, {});
+      return send(res, 200, { identity: { id: targetId, active: false }, revoked: true });
     }
 
     if (req.method === 'GET' && url.pathname === '/v1/export') {
