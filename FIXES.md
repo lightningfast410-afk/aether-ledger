@@ -363,3 +363,49 @@ Manual checks beyond the suite (all passed):
 - No stray `aether.db` files were left in the repo tree by the test
   runs (the server test uses a temp directory; the ledger test's
   leftover `-wal`/`-shm` files were removed after the run).
+
+---
+
+## Hardening round 2 — October 25, 2026 (anti-theft / real-use)
+
+Goal: make theft harder to pull off, easier to stop, and easier to
+prove — and make a real deployment a checklist instead of a guess.
+Nothing here claims the public code is theft-proof. Public code can
+always be copied; what this round adds is ownership proof, a kill
+switch, a fail-closed production start, and a deploy runbook.
+
+1. **Token revoke (kill switch)** — new `POST /v1/identities/:id/revoke`,
+   admin only. A revoked identity's token returns 401 on every later
+   request, because authentication already requires `active = 1`. An
+   admin cannot revoke themselves, so a second admin identity should be
+   kept stored safely for recovery. Covered by a new server test:
+   non-admin revoke is 403, self-revoke is 400, revocation kills the
+   token immediately, double revoke is 400.
+2. **Production fail-closed secret** — with `NODE_ENV=production` and
+   no `LEDGER_HMAC_SECRET`, the server now refuses to start instead of
+   booting on an ephemeral secret whose attestations would not verify
+   after a restart. Non-production runs keep the previous loud warning
+   and still boot, so development and the test suite are unchanged.
+3. **Ownership & provenance** — README gains an Ownership & provenance
+   section (author, repository, original and fix dates) pointing at
+   `PROVENANCE.md`, a manifest of the published files with SHA-256
+   hashes and the fix commits. If someone republishes this code as
+   their own, the manifest plus the dated commit history is the proof
+   of origin.
+4. **Real-use runbook** — new `DEPLOY.md`: stable secret from a secret
+   store, HTTPS reverse proxy, single-process limit, database backups
+   with tested restores, startup `/health` + `/v1/verify` checks,
+   token handling, and the revoke procedure, plus the honest limits
+   (server-side attestations, not user signatures; no legal title;
+   no independent audit yet).
+5. **Secret scan clean** — a scan of the repo tree (excluding
+   `node_modules`) found no committed credentials, private keys, or
+   provider tokens. `.gitignore` already excludes `.env`, logs, and
+   `node_modules`.
+
+License note, stated plainly: the README license is MIT and is NOT
+changed by this round. Code already published under MIT stays
+MIT-licensed to anyone who already received it — a new license line
+cannot claw that back. A future license change would only govern
+later versions, and it is a separate decision, not something this
+round pretends to have done.
