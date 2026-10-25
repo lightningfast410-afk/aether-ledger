@@ -12,9 +12,36 @@ const DB_FILE = process.env.DB_FILE || path.join(__dirname, 'aether.db');
 const MAX_BODY_BYTES = 1024 * 1024;
 
 const sha256 = (value) => crypto.createHash('sha256').update(value).digest('hex');
-const canonical = (obj) => JSON.stringify(obj, Object.keys(obj).sort());
+
+// Deep canonicalization: recursively sorts object keys. The original used
+// JSON.stringify(obj, Object.keys(obj).sort()), which passes the sorted
+// top-level keys as a REPLACER ARRAY: nested objects were serialized with
+// only the keys listed at the top level, silently dropping nested keys.
+// This version sorts at every depth.
+function canonical(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
+  const keys = Object.keys(value).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${canonical(value[k])}`).join(',')}}`;
+}
+
 const now = () => new Date().toISOString();
 const randomId = (prefix) => `${prefix}_${crypto.randomUUID()}`;
+
+// Transaction attestations are HMAC-SHA256 under a server-side secret.
+// These are SERVER ATTESTATIONS, not signatures made with user-held
+// private keys: anyone holding the secret can forge them, and a holder
+// cannot independently prove authorship. See README.md.
+let HMAC_SECRET = process.env.LEDGER_HMAC_SECRET || null;
+if (!HMAC_SECRET) {
+  HMAC_SECRET = crypto.randomBytes(32).toString('hex');
+  console.warn(
+    'WARNING: LEDGER_HMAC_SECRET is not set. Using an ephemeral per-process HMAC secret: ' +
+    'transaction attestations created by this process will NOT verify after a restart. ' +
+    'Set LEDGER_HMAC_SECRET to a stable secret for persistent attestations.'
+  );
+}
+const hmac = (value) => crypto.createHmac('sha256', HMAC_SECRET).update(value).digest('hex');
 
 const db = initializeDatabase(DB_FILE);
 const security = new SecurityEngine(db);
@@ -35,6 +62,18 @@ function requiredString(value, name, max = 256) {
 function positiveNumber(value, name) {
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
     throw error(`${name} must be a positive number`);
+  }
+  return value;
+}
+
+// Amounts and supplies are integers at the API boundary (the README
+// examples already use integers). Columns stay REAL for storage, but
+// fractional values are rejected here so float rounding can never split
+// a unit.
+function integerAmount(value, name) {
+  positiveNumber(value, name);
+  if (!Number.isInteger(value)) {
+    throw error(`${name} must be a positive integer`);
   }
   return value;
 }
@@ -81,35 +120,27 @@ function ensureIdentityExists(id) {
   return identity;
 }
 
-function getIdentityByToken(token) {
-  if (!token) return null;
-  return db.prepare('SELECT id, name, role, publicKey FROM identities WHERE publicKey = ? AND active = 1').get(token);
-}
-
-function authenticateRequest(req) {
-  const authHeader = req.headers.authorization || '';
-  const token = authHeader.startsWith('Bearer ') ? authHeader.substring(7) : null;
-  if (!token) throw error('Missing Authorization header. Use Bearer <token>', 401);
-
-  const identity = getIdentityByToken(token);
-  if (!identity) throw error('Invalid or expired bearer token', 401);
-  return identity;
-}
-
 function issueIdentity(name, role = 'holder') {
   const allowedRoles = ['holder', 'issuer', 'auditor', 'admin'];
   if (!allowedRoles.includes(role)) throw error('invalid role');
 
   const id = randomId('id');
+  // publicKey is a NON-SECRET identifier. It is not a credential and is
+  // never accepted for authentication.
   const publicKey = sha256(`${id}:${name}:${role}:${now()}`);
+  // The bearer token is random and independent of the publicKey. Only
+  // its SHA-256 is stored; the raw token is returned exactly once, at
+  // creation, and never appears in any other response.
+  const token = crypto.randomBytes(32).toString('hex');
+  const tokenHash = sha256(token);
   const createdAt = now();
 
   db.prepare(`
-    INSERT INTO identities (id, name, role, publicKey, createdAt, updatedAt, active, metadata)
-    VALUES (?, ?, ?, ?, ?, ?, 1, ?)
-  `).run(id, name, role, publicKey, createdAt, createdAt, JSON.stringify({ createdVia: 'api' }));
+    INSERT INTO identities (id, name, role, publicKey, tokenHash, createdAt, updatedAt, active, metadata)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+  `).run(id, name, role, publicKey, tokenHash, createdAt, createdAt, JSON.stringify({ createdVia: 'api' }));
 
-  return { id, name, role, publicKey, createdAt, token: publicKey };
+  return { id, name, role, publicKey, createdAt, token };
 }
 
 function getAsset(assetId) {
@@ -139,50 +170,93 @@ function getBalances(assetId) {
 }
 
 function getLatestBlockIndex() {
-  return db.prepare('SELECT MAX(index) AS maxIndex FROM blocks').get()?.maxIndex ?? -1;
+  return db.prepare('SELECT MAX("index") AS maxIndex FROM blocks').get()?.maxIndex ?? -1;
 }
 
 function createGenesisBlock() {
   const count = db.prepare('SELECT COUNT(*) AS count FROM blocks').get().count;
   if (count > 0) return null;
-  const block = createBlock(0, 'genesis');
+  // Genesis has no miner identity, so miner is NULL (the column is
+  // nullable). The original used the string 'genesis', which violated
+  // the blocks.miner -> identities(id) foreign key on a fresh database.
+  const block = createBlock(0, null);
   return block;
+}
+
+// SHA-256 over a block's transactions, as "id:signature" pairs in
+// (timestamp, id) order. Empty string hash when the block has no
+// transactions (identity/asset blocks carry no transaction rows).
+function computeTxRoot(blockIndex) {
+  const txs = db.prepare('SELECT id, signature FROM transactions WHERE blockIndex = ? ORDER BY timestamp, id').all(blockIndex);
+  if (txs.length === 0) return sha256('');
+  return sha256(txs.map((t) => `${t.id}:${t.signature}`).join('|'));
+}
+
+// Recomputes the server attestation a transaction row should carry.
+// Returns null for unknown types (no re-verification possible).
+function expectedTxSignature(tx) {
+  if (tx.type === 'transfer') {
+    return hmac(`${tx.id}:${tx.assetId}:${tx.from}:${tx.to}:${tx.amount}:${tx.timestamp}`);
+  }
+  if (tx.type === 'retire') {
+    return hmac(`${tx.id}:${tx.assetId}:${tx.from}:retire:${tx.amount}:${tx.timestamp}`);
+  }
+  return null;
 }
 
 function createBlock(transactionCount, miner) {
   const index = getLatestBlockIndex() + 1;
-  const previous = db.prepare('SELECT hash FROM blocks WHERE index = ?').get(index - 1);
+  const previous = db.prepare('SELECT hash FROM blocks WHERE "index" = ?').get(index - 1);
   const previousHash = previous?.hash || '0'.repeat(64);
   const timestamp = now();
-  const payload = { index, timestamp, previousHash, transactionCount, miner, nonce: 0 };
+  // Transaction rows for this block are inserted BEFORE createBlock is
+  // called (see the transfer/retire routes), so the root commits to them.
+  const txRoot = computeTxRoot(index);
+  const payload = { index, timestamp, previousHash, transactionCount, miner, nonce: 0, txRoot };
   const hash = sha256(canonical(payload));
 
   db.prepare(`
-    INSERT INTO blocks (index, hash, previousHash, timestamp, transactionCount, miner, nonce)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(index, hash, previousHash, timestamp, transactionCount, miner, 0);
+    INSERT INTO blocks ("index", hash, previousHash, timestamp, transactionCount, miner, nonce, txRoot)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(index, hash, previousHash, timestamp, transactionCount, miner, 0, txRoot);
 
-  return { index, hash, previousHash, timestamp, transactionCount, miner };
+  return { index, hash, previousHash, timestamp, transactionCount, miner, txRoot };
 }
 
 function validateChain() {
-  const blocks = db.prepare('SELECT index, hash, previousHash, timestamp, transactionCount, miner, nonce FROM blocks ORDER BY index').all();
+  const blocks = db.prepare('SELECT "index", hash, previousHash, timestamp, transactionCount, miner, nonce, txRoot FROM blocks ORDER BY "index"').all();
   if (blocks.length === 0) return { valid: true, length: 0 };
 
   for (let i = 0; i < blocks.length; i += 1) {
     const block = blocks[i];
+    // The chain commits to transaction contents: recompute this block's
+    // txRoot from the transactions table and compare.
+    const txRoot = computeTxRoot(block.index);
+    if (txRoot !== block.txRoot) return { valid: false, index: i, reason: 'txRoot mismatch' };
     const payload = {
       index: block.index,
       timestamp: block.timestamp,
       previousHash: block.previousHash,
       transactionCount: block.transactionCount,
       miner: block.miner,
-      nonce: block.nonce
+      nonce: block.nonce,
+      txRoot: block.txRoot
     };
     const computedHash = sha256(canonical(payload));
     if (computedHash !== block.hash) return { valid: false, index: i, reason: 'hash mismatch' };
     if (i === 0 && block.previousHash !== '0'.repeat(64)) return { valid: false, index: i, reason: 'invalid genesis' };
     if (i > 0 && block.previousHash !== blocks[i - 1].hash) return { valid: false, index: i, reason: 'broken link' };
+    // Defense in depth: re-verify each transaction attestation, so even
+    // an edit that leaves the txRoot intact (impossible without the
+    // signature, but checked anyway) or a row whose amount was edited
+    // without touching its signature is caught.
+    const txs = db.prepare('SELECT id, type, assetId, "from", "to", amount, signature, timestamp FROM transactions WHERE blockIndex = ?').all(block.index);
+    for (const tx of txs) {
+      const expected = expectedTxSignature(tx);
+      if (expected !== null && expected !== tx.signature) {
+        return { valid: false, index: i, reason: 'transaction signature mismatch' };
+      }
+    }
   }
 
   return { valid: true, length: blocks.length };
@@ -225,10 +299,10 @@ function doTransfer({ assetId, from, to, amount, actorId }) {
   const txId = randomId('tx');
   const timestamp = now();
   const blockIndex = getLatestBlockIndex() + 1;
-  const signature = sha256(`${txId}:${assetId}:${from}:${to}:${amount}:${timestamp}`);
+  const signature = hmac(`${txId}:${assetId}:${from}:${to}:${amount}:${timestamp}`);
 
   db.prepare(`
-    INSERT INTO transactions (id, type, assetId, from, to, amount, signature, blockIndex, timestamp, status, metadata)
+    INSERT INTO transactions (id, type, assetId, "from", "to", amount, signature, blockIndex, timestamp, status, metadata)
     VALUES (?, 'transfer', ?, ?, ?, ?, ?, ?, ?, 'confirmed', ?)
   `).run(txId, assetId, from, to, amount, signature, blockIndex, timestamp, JSON.stringify({ actorId }));
 
@@ -254,10 +328,10 @@ function retireCredits({ assetId, holderId, amount, actorId }) {
   const txId = randomId('tx');
   const timestamp = now();
   const blockIndex = getLatestBlockIndex() + 1;
-  const signature = sha256(`${txId}:${assetId}:${holderId}:retire:${amount}:${timestamp}`);
+  const signature = hmac(`${txId}:${assetId}:${holderId}:retire:${amount}:${timestamp}`);
 
   db.prepare(`
-    INSERT INTO transactions (id, type, assetId, from, to, amount, signature, blockIndex, timestamp, status, metadata)
+    INSERT INTO transactions (id, type, assetId, "from", "to", amount, signature, blockIndex, timestamp, status, metadata)
     VALUES (?, 'retire', ?, ?, NULL, ?, ?, ?, ?, 'confirmed', ?)
   `).run(txId, assetId, holderId, amount, signature, blockIndex, timestamp, JSON.stringify({ actorId, retirement: true }));
 
@@ -293,6 +367,14 @@ function makeAudit(assetId, auditorId) {
   return result;
 }
 
+// Ownership rule shared by the transfer/retire/asset routes: the caller
+// must be the owner named in the body, unless the caller is an admin.
+function requireOwnerOrAdmin(identity, ownerId, what) {
+  if (identity.role !== 'admin' && identity.id !== ownerId) {
+    throw error(`${what} must match the caller unless admin`, 403);
+  }
+}
+
 async function handler(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const parts = url.pathname.split('/').filter(Boolean);
@@ -311,13 +393,31 @@ async function handler(req, res) {
       const body = await parseJsonBody(req);
       const name = requiredString(body.name, 'name', 128);
       const role = body.role || 'holder';
+      // Bootstrap rule: while the identities table is empty, any role
+      // may be created (this is what makes the README quick-start work
+      // for the first identity). Once bootstrapped, creating an
+      // issuer/auditor/admin requires an authenticated admin; anyone
+      // may still self-register as a holder.
+      const identityCount = db.prepare('SELECT COUNT(*) AS count FROM identities').get().count;
+      if (identityCount > 0 && role !== 'holder') {
+        const caller = security.authenticate(req);
+        if (caller.role !== 'admin') {
+          throw error('admin role required to create privileged identities', 403);
+        }
+      }
       const created = issueIdentity(name, role);
       const block = createBlock(1, created.id);
       security.logAudit('IDENTITY_CREATED', created.id, 'create-identity', 'identities', true, { role });
-      return send(res, 201, { identity: created, token: created.token, block });
+      // The token is returned exactly once, here, at creation. It is
+      // deliberately NOT part of the identity object, and no other
+      // endpoint returns it (or the stored tokenHash) anywhere.
+      const { token, ...identity } = created;
+      return send(res, 201, { identity, token, block });
     }
 
-    const identity = authenticateRequest(req);
+    // Single authentication path (security.authenticate); the server's
+    // old duplicate authenticateRequest was removed.
+    const identity = security.authenticate(req);
     security.checkRateLimit(identity.id, `${req.method}:${url.pathname}`, 100, 60);
 
     if (req.method === 'GET' && url.pathname === '/v1/identities') {
@@ -340,12 +440,17 @@ async function handler(req, res) {
 
     if (req.method === 'POST' && url.pathname === '/v1/assets') {
       const body = await parseJsonBody(req);
+      const vertical = requiredString(body.vertical, 'vertical');
+      const name = requiredString(body.name, 'name', 200);
+      const issuerId = requiredString(body.issuerId, 'issuerId');
+      const supply = integerAmount(body.supply, 'supply');
       security.authorize(identity, 'issue', 'asset');
+      requireOwnerOrAdmin(identity, issuerId, 'issuerId');
       const asset = createAssetRecord({
-        vertical: requiredString(body.vertical, 'vertical'),
-        name: requiredString(body.name, 'name', 200),
-        issuerId: requiredString(body.issuerId, 'issuerId'),
-        supply: positiveNumber(body.supply, 'supply'),
+        vertical,
+        name,
+        issuerId,
+        supply,
         metadata: body.metadata && typeof body.metadata === 'object' ? body.metadata : {},
         description: typeof body.description === 'string' ? body.description : ''
       });
@@ -363,14 +468,13 @@ async function handler(req, res) {
 
     if (req.method === 'POST' && url.pathname === '/v1/transfers') {
       const body = await parseJsonBody(req);
+      const assetId = requiredString(body.assetId, 'assetId');
+      const from = requiredString(body.from, 'from');
+      const to = requiredString(body.to, 'to');
+      const amount = integerAmount(body.amount, 'amount');
       security.authorize(identity, 'transfer', 'asset-transfer');
-      const transfer = doTransfer({
-        assetId: requiredString(body.assetId, 'assetId'),
-        from: requiredString(body.from, 'from'),
-        to: requiredString(body.to, 'to'),
-        amount: positiveNumber(body.amount, 'amount'),
-        actorId: identity.id
-      });
+      requireOwnerOrAdmin(identity, from, 'from');
+      const transfer = doTransfer({ assetId, from, to, amount, actorId: identity.id });
       const block = createBlock(1, identity.id);
       security.logAudit('TRANSFER', identity.id, 'transfer', transfer.assetId, true, { from: transfer.from, to: transfer.to, amount: transfer.amount });
       return send(res, 201, { transaction: transfer, block, balances: getBalances(transfer.assetId) });
@@ -378,13 +482,12 @@ async function handler(req, res) {
 
     if (req.method === 'POST' && url.pathname === '/v1/retire') {
       const body = await parseJsonBody(req);
+      const assetId = requiredString(body.assetId, 'assetId');
+      const holderId = requiredString(body.holderId, 'holderId');
+      const amount = integerAmount(body.amount, 'amount');
       security.authorize(identity, 'retire', 'asset-retirement');
-      const retire = retireCredits({
-        assetId: requiredString(body.assetId, 'assetId'),
-        holderId: requiredString(body.holderId, 'holderId'),
-        amount: positiveNumber(body.amount, 'amount'),
-        actorId: identity.id
-      });
+      requireOwnerOrAdmin(identity, holderId, 'holderId');
+      const retire = retireCredits({ assetId, holderId, amount, actorId: identity.id });
       const block = createBlock(1, identity.id);
       security.logAudit('RETIRE', identity.id, 'retire', retire.assetId, true, { holderId: retire.holderId, amount: retire.amount });
       return send(res, 201, { transaction: retire, block });
@@ -392,7 +495,7 @@ async function handler(req, res) {
 
     if (req.method === 'GET' && url.pathname === '/v1/blocks') {
       security.authorize(identity, 'view', 'blocks');
-      const rows = db.prepare('SELECT index, hash, previousHash, timestamp, transactionCount, miner FROM blocks ORDER BY index').all();
+      const rows = db.prepare('SELECT "index", hash, previousHash, timestamp, transactionCount, miner, txRoot FROM blocks ORDER BY "index"').all();
       return send(res, 200, { blocks: rows });
     }
 
