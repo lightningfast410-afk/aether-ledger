@@ -14,15 +14,21 @@ const randomId = (prefix) => `${prefix}_${crypto.randomUUID()}`;
 
 function createIdentity(name, role) {
   const id = randomId('id');
+  // publicKey is a non-secret identifier, NOT a credential.
   const publicKey = sha256(`${id}:${name}:${role}:${now()}`);
+  // Bearer token: random, independent of the publicKey. Only its SHA-256
+  // is stored; the raw token is printed exactly once below, for demo use,
+  // and never stored anywhere else.
+  const token = crypto.randomBytes(32).toString('hex');
+  const tokenHash = sha256(token);
   const createdAt = now();
-  
+
   db.prepare(`
-    INSERT INTO identities (id, name, role, publicKey, createdAt, updatedAt, active, metadata)
-    VALUES (?, ?, ?, ?, ?, ?, 1, ?)
-  `).run(id, name, role, publicKey, createdAt, createdAt, JSON.stringify({ createdVia: 'bootstrap' }));
-  
-  return { id, name, role, publicKey, createdAt, token: publicKey };
+    INSERT INTO identities (id, name, role, publicKey, tokenHash, createdAt, updatedAt, active, metadata)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+  `).run(id, name, role, publicKey, tokenHash, createdAt, createdAt, JSON.stringify({ createdVia: 'bootstrap' }));
+
+  return { id, name, role, publicKey, createdAt, token };
 }
 
 function createAsset(vertical, name, issuerId, supply, description = '') {
