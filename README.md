@@ -128,6 +128,7 @@ curl -X POST http://localhost:3000/v1/audit \
 - `GET /v1/identities` — list all identities
 - `POST /v1/identities` — create a new identity (issuer, auditor, holder, admin)
 - `GET /v1/identities/:id` — retrieve identity by ID
+- `POST /v1/identities/:id/revoke` — admin only: kill an identity's token immediately (anti-theft kill switch; a revoked token returns 401 on every later request, an admin cannot revoke themselves)
 
 ### Assets
 - `GET /v1/assets` — list all assets (supports `?vertical=carbon_credits` filter)
@@ -252,6 +253,16 @@ Includes:
 ✅ **Replace in-memory rate limiting** with a shared store if you ever run
    more than one process
 ✅ **Add observability**: logs, metrics, traces
+
+## Ownership & provenance
+
+Copyright (c) 2026 Zackariah Partridge. Repository:
+`github.com/lightningfast410-afk/aether-ledger`. Original code September 2026;
+security fix published October 25, 2026; anti-theft hardening (token revoke,
+production fail-closed secret, provenance manifest) added the same day. See
+`PROVENANCE.md` for the file manifest and commit record, and `DEPLOY.md`
+before running this for real. Removing authorship or attribution is not
+permitted under the license below.
 
 ## License
 
