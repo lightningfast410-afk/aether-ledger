@@ -228,3 +228,32 @@ test('audit supply conservation holds', async () => {
   assert.equal(json.audit.totalBalance, 1000);
   assert.equal(json.audit.retired, 10);
 });
+
+test('revoke kills a stolen token immediately (anti-theft)', async () => {
+  // Fresh victim holder, created by admin, so nothing else depends on it.
+  const victim = await req('POST', '/v1/identities', { name: 'Victim Holder', role: 'holder' }, ctx.adminToken);
+  assert.equal(victim.status, 201);
+  const victimToken = victim.json.token;
+  const victimId = victim.json.identity.id;
+
+  // Non-admin may not revoke -> 403, token still works.
+  const asHolder = await req('POST', `/v1/identities/${victimId}/revoke`, null, ctx.holderAToken);
+  assert.equal(asHolder.status, 403);
+  const stillWorks = await req('GET', '/v1/identities', null, victimToken);
+  assert.equal(stillWorks.status, 200);
+
+  // Admin may not revoke themselves -> 400, admin token still works.
+  const selfRevoke = await req('POST', `/v1/identities/${ctx.admin.id}/revoke`, null, ctx.adminToken);
+  assert.equal(selfRevoke.status, 400);
+
+  // Admin revokes the victim -> 200, and the token dies immediately.
+  const revoked = await req('POST', `/v1/identities/${victimId}/revoke`, null, ctx.adminToken);
+  assert.equal(revoked.status, 200);
+  assert.equal(revoked.json.revoked, true);
+  const dead = await req('GET', '/v1/identities', null, victimToken);
+  assert.equal(dead.status, 401);
+
+  // Revoking twice -> 400.
+  const again = await req('POST', `/v1/identities/${victimId}/revoke`, null, ctx.adminToken);
+  assert.equal(again.status, 400);
+});
