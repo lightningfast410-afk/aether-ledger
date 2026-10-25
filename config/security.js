@@ -1,13 +1,38 @@
 /**
  * Security Configuration & Enforcement
  * Centralizes auth, validation, and policy checks
+ *
+ * Fixed copy notes (see FIXES.md):
+ * - This is now the ONLY authentication path: server.js calls
+ *   security.authenticate(). The server's duplicate authenticateRequest /
+ *   getIdentityByToken were removed.
+ * - Bearer tokens are random values; only their SHA-256 (tokenHash) is
+ *   stored. publicKey is a non-secret identifier and is NOT a credential.
+ * - Dead methods from the original (validateTransaction, signTransaction,
+ *   generateNonce, verifyNonce) were deleted: they were never called and
+ *   duplicated logic the server already implements inline.
+ * - Auth errors carry HTTP status (401 authentication, 403 authorization)
+ *   instead of plain Errors that the handler mapped to 500.
+ * - The rate limiter is in-memory and single-process only: it does not
+ *   survive restarts and does not coordinate across processes. Documented
+ *   as such; do not rely on it as a distributed control.
  */
 
 const crypto = require('node:crypto');
 
+function httpError(message, status) {
+  const err = new Error(message);
+  err.status = status;
+  return err;
+}
+
+const sha256 = (value) => crypto.createHash('sha256').update(value).digest('hex');
+
 const ROLES = {
   admin: { label: 'Administrator', permissions: ['*'] },
-  issuer: { label: 'Asset Issuer', permissions: ['issue', 'transfer', 'retire', 'audit:self'] },
+  // NOTE: the original issuer permission 'audit:self' never matched any
+  // authorize() check and was removed.
+  issuer: { label: 'Asset Issuer', permissions: ['issue', 'transfer', 'retire'] },
   holder: { label: 'Asset Holder', permissions: ['transfer', 'view'] },
   auditor: { label: 'Compliance Auditor', permissions: ['audit', 'view', 'export'] },
   retired: { label: 'Retired Account', permissions: ['view'] }
@@ -40,26 +65,30 @@ const VERTICALS = {
 class SecurityEngine {
   constructor(db) {
     this.db = db;
-    this.auditLog = [];
   }
 
   /**
-   * Authenticate a request based on API key or signature
+   * Authenticate a request by bearer token.
+   * The presented token is hashed and compared against the stored
+   * tokenHash; the raw token is never stored and publicKey is NOT
+   * accepted as a credential.
    */
   authenticate(req) {
     const authHeader = req.headers.authorization || '';
-    
+
     if (!authHeader.startsWith('Bearer ')) {
-      throw new Error('Missing or invalid Authorization header');
+      throw httpError('Missing or invalid Authorization header', 401);
     }
-    
+
     const token = authHeader.slice(7);
-    const identity = this.db.prepare('SELECT id, name, role FROM identities WHERE publicKey = ? AND active = 1').get(token);
-    
+    const identity = this.db.prepare(
+      'SELECT id, name, role FROM identities WHERE tokenHash = ? AND active = 1'
+    ).get(sha256(token));
+
     if (!identity) {
-      throw new Error('Invalid or revoked API token');
+      throw httpError('Invalid or revoked API token', 401);
     }
-    
+
     return identity;
   }
 
@@ -68,46 +97,14 @@ class SecurityEngine {
    */
   authorize(identity, action, resource = null) {
     const role = ROLES[identity.role];
-    if (!role) throw new Error('Invalid role');
-    
+    if (!role) throw httpError('Invalid role', 403);
+
     if (role.permissions.includes('*')) return true;
     if (!role.permissions.includes(action)) {
       this.logAudit('UNAUTHORIZED_ACTION', identity.id, action, resource, false);
-      throw new Error(`Identity ${identity.id} (${identity.role}) is not authorized for ${action}`);
+      throw httpError(`Identity ${identity.id} (${identity.role}) is not authorized for ${action}`, 403);
     }
-    
-    return true;
-  }
 
-  /**
-   * Validate a transaction against ledger rules
-   */
-  validateTransaction(txType, identity, assetId, from, to, amount) {
-    const asset = this.db.prepare('SELECT vertical, supply, circulatingSupply FROM assets WHERE id = ?').get(assetId);
-    if (!asset) throw new Error('Asset not found');
-    
-    const vertical = VERTICALS[asset.vertical];
-    if (!vertical) throw new Error('Invalid vertical');
-    
-    // Check balance
-    const balance = this.db.prepare('SELECT amount FROM balances WHERE assetId = ? AND holderId = ?').get(assetId, from)?.amount || 0;
-    if (balance < amount) {
-      this.logAudit('INSUFFICIENT_BALANCE', identity.id, txType, assetId, false, { from, amount, balance });
-      throw new Error('Insufficient balance');
-    }
-    
-    // Check if retirement is allowed
-    if (txType === 'retire' && !vertical.retireable) {
-      this.logAudit('RETIRE_NOT_ALLOWED', identity.id, txType, assetId, false, { vertical: asset.vertical });
-      throw new Error(`${vertical.name} tokens cannot be retired`);
-    }
-    
-    // Check if amount exceeds circulating supply for retirement
-    if (txType === 'retire' && amount > asset.circulatingSupply) {
-      this.logAudit('RETIRE_EXCEEDS_SUPPLY', identity.id, txType, assetId, false, { amount, circulatingSupply: asset.circulatingSupply });
-      throw new Error('Retirement amount exceeds circulating supply');
-    }
-    
     return true;
   }
 
@@ -125,7 +122,7 @@ class SecurityEngine {
       metadata,
       ipAddress: metadata.ipAddress || 'unknown'
     };
-    
+
     try {
       const stmt = this.db.prepare(
         'INSERT INTO audit_log (timestamp, eventType, identityId, action, resource, success, metadata) VALUES (?, ?, ?, ?, ?, ?, ?)'
@@ -142,74 +139,39 @@ class SecurityEngine {
     } catch (error) {
       console.error('Audit log error:', error);
     }
-    
+
     return auditEntry;
   }
 
   /**
-   * Generate a secure nonce to prevent replay attacks
-   */
-  generateNonce(identityId) {
-    const nonce = crypto.randomBytes(32).toString('hex');
-    const stmt = this.db.prepare('INSERT INTO nonces (identityId, nonce, createdAt, expiresAt) VALUES (?, ?, ?, ?)');
-    const now = new Date();
-    const expires = new Date(now.getTime() + 5 * 60 * 1000); // 5 min expiry
-    stmt.run(identityId, nonce, now.toISOString(), expires.toISOString());
-    return nonce;
-  }
-
-  /**
-   * Verify nonce is valid and not reused
-   */
-  verifyNonce(identityId, nonce) {
-    const storedNonce = this.db.prepare('SELECT nonce, expiresAt FROM nonces WHERE identityId = ? AND nonce = ?').get(identityId, nonce);
-    if (!storedNonce) throw new Error('Invalid or expired nonce');
-    
-    if (new Date(storedNonce.expiresAt) < new Date()) {
-      throw new Error('Nonce expired');
-    }
-    
-    // Invalidate nonce after use
-    this.db.prepare('DELETE FROM nonces WHERE identityId = ? AND nonce = ?').run(identityId, nonce);
-    
-    return true;
-  }
-
-  /**
-   * Generate a signature for a transaction (server-side signing)
-   */
-  signTransaction(payload) {
-    const canonical = JSON.stringify(payload, Object.keys(payload).sort());
-    return crypto.createHash('sha256').update(canonical).digest('hex').substring(0, 32);
-  }
-
-  /**
-   * Check if account is rate-limited
+   * Check if account is rate-limited.
+   * IN-MEMORY, SINGLE-PROCESS ONLY: counters reset on restart and are
+   * not shared between processes. Do not treat this as a distributed
+   * rate limit.
    */
   checkRateLimit(identityId, action, limit = 100, windowSeconds = 60) {
     const key = `ratelimit:${identityId}:${action}`;
     const now = Date.now();
-    
-    // Simple in-memory rate limit (upgrade to Redis for production)
+
     if (!this.rateLimitStore) this.rateLimitStore = {};
-    
+
     if (!this.rateLimitStore[key]) {
       this.rateLimitStore[key] = { count: 0, resetTime: now + windowSeconds * 1000 };
     }
-    
+
     const bucket = this.rateLimitStore[key];
-    
+
     if (now > bucket.resetTime) {
       bucket.count = 0;
       bucket.resetTime = now + windowSeconds * 1000;
     }
-    
+
     bucket.count++;
     if (bucket.count > limit) {
       this.logAudit('RATE_LIMIT_EXCEEDED', identityId, action, null, false, { limit, actual: bucket.count });
-      throw new Error(`Rate limit exceeded: ${limit} ${action} per ${windowSeconds}s`);
+      throw httpError(`Rate limit exceeded: ${limit} ${action} per ${windowSeconds}s`, 429);
     }
-    
+
     return true;
   }
 
@@ -219,7 +181,7 @@ class SecurityEngine {
   exportAuditLog(startDate, endDate, filter = {}) {
     let query = 'SELECT * FROM audit_log WHERE timestamp >= ? AND timestamp <= ?';
     const params = [startDate, endDate];
-    
+
     if (filter.identityId) {
       query += ' AND identityId = ?';
       params.push(filter.identityId);
@@ -232,9 +194,9 @@ class SecurityEngine {
       query += ' AND success = ?';
       params.push(filter.success ? 1 : 0);
     }
-    
+
     query += ' ORDER BY timestamp DESC';
-    
+
     const logs = this.db.prepare(query).all(...params);
     return logs.map(log => ({
       ...log,
