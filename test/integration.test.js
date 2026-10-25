@@ -38,7 +38,7 @@ test('Real Estate vertical: issue and transfer tokens', async (t) => {
       CREATE TABLE identities (id TEXT PRIMARY KEY, name TEXT UNIQUE, role TEXT DEFAULT 'holder', publicKey TEXT UNIQUE, createdAt TEXT, active INTEGER DEFAULT 1);
       CREATE TABLE assets (id TEXT PRIMARY KEY, vertical TEXT, name TEXT, issuerId TEXT, supply REAL, circulatingSupply REAL, retiredSupply REAL DEFAULT 0, metadata TEXT, createdAt TEXT);
       CREATE TABLE balances (assetId TEXT, holderId TEXT, amount REAL, updatedAt TEXT, PRIMARY KEY (assetId, holderId));
-      CREATE TABLE blocks (index INTEGER PRIMARY KEY, hash TEXT UNIQUE, previousHash TEXT, timestamp TEXT, transactionCount INTEGER, miner TEXT, nonce INTEGER DEFAULT 0);
+      CREATE TABLE blocks ("index" INTEGER PRIMARY KEY, hash TEXT UNIQUE, previousHash TEXT, timestamp TEXT, transactionCount INTEGER, miner TEXT, nonce INTEGER DEFAULT 0);
     `);
 
     const stmtId = db.prepare('INSERT INTO identities (id, name, role, publicKey, createdAt) VALUES (?, ?, ?, ?, ?)');
